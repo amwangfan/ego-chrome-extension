@@ -1,41 +1,43 @@
 ---
 name: ego-chrome
-description: Control the user's current Chrome profile through the local ego-chrome extension and CLI. Use for website navigation, forms, dynamic menus, extraction, and browser testing that benefit from existing login state. Minimize tool rounds and model input: keep predictable work in one invocation, prefer targeted DOM reads, use compact semantic snapshots only when needed, and never use screenshots unless the user explicitly requests visual inspection and another tool is available.
+description: Control the user's current Chrome profile through the local ego-chrome extension and CLI. Use for navigation, forms, dynamic interfaces, extraction, and browser testing that benefit from existing login state. Minimize execution rounds and model input: keep predictable work in one invocation, prefer semantic locators and bounded DOM reads, and use compact snapshots only when the state is genuinely unknown.
 metadata:
-  version: "0.2.0"
+  version: "0.2.1"
 ---
 
 # ego-chrome
 
-`ego-chrome` exposes the user's running Chrome profile through a local CLI. It reuses existing login state and operates background tabs with semantic text instead of screenshots.
+`ego-chrome` exposes the user's running Chrome profile through a CLI-accessible Node.js runtime. The preloaded `page`, `page.locator(...)`, and `browser` facades use Playwright-style names while reusing the user's current login state.
 
-## Execution model
+Run browser work as a PowerShell here-string piped to `ego-chrome nodejs`. Put JavaScript directly in the here-string; do not create a temporary script, import Playwright, launch another browser, or invent helper names.
 
-Run the first real browser operation immediately. Do not run `ego-chrome --doctor` before every task. Use `--doctor` only after a connection or extension error.
+**A here-string is only the JavaScript container; the shell invocation is the execution round. Default to one shell invocation for the whole browser task.** Each `await` is an internal operation, not a step boundary. Before launch, encode every predictable observation, action, wait, extraction, verification, and bounded alternative in the script. Use browser results immediately in JavaScript and keep adapting in-process until the task completes; do not exit merely to inspect intermediate output or plan the next action. Start another command only for required user or external control, or a process-level failure the script cannot recover from.
 
-On PowerShell:
+**Choose the least-stateful reliable route before inspecting page controls.** When the task specifies an outcome or constraints but not a required interaction, prefer an already-correct state or a known stable URL or site route that directly encodes them; verify the resulting goal state instead of replaying equivalent filters, sorting, or navigation through the UI. Use page controls when the user requested that interaction, the interaction itself is under test, or no reliable equivalent is known. Never invent a brittle route.
+
+**Treat an already-satisfied postcondition as completed work.** Before manipulating a control whose required value may already be visible, perform only the smallest read needed to decide that state. If it matches, do not open its editor, replay the interaction, or read it again; continue directly to the remaining unsatisfied outcomes. Words such as “set”, “select”, or “ensure” describe the required final state unless the user explicitly requires the transition or the interaction itself is under test.
+
+**Freeze the time window for current or relative-date work.** Establish “today/current/latest” once from the user/task environment or explicitly verified current page state before collecting records. Treat content timestamps as data, not as the clock. Older records revealed by scrolling, virtualization, reload, cache, or a changed result batch must not replace that anchor.
+
+When the user explicitly asks for ego-chrome, assume the CLI and runtime are ready. Do not preflight Node versions, package metadata, help, or `--doctor`. Investigate setup only after the first real browser command reports a connection or installation error.
+
+## Quick start
 
 ```powershell
 @'
 await browser.openTab('https://example.com', { active: false, wait: true })
-const result = { title: await page.title(), url: await page.url() }
-console.log(JSON.stringify(result))
+const heading = await page.getByRole('heading').first().innerText()
+const info = await page.info()
+if (!heading || !info.url) throw new Error('Page was not ready')
+console.log(JSON.stringify({ heading, url: info.url }))
 '@ | ego-chrome nodejs
 ```
 
-A here-string is only the JavaScript container. **Default to one shell invocation for the whole browser task.** Encode every predictable read, branch, action, wait, extraction, fallback, and verification in that script. Use JavaScript variables, conditions, loops, and bounded alternatives instead of exiting after each action.
-
-Start another invocation only when:
-
-- the prior output is genuinely required for an unpredictable decision;
-- the user must complete a real secret or human-verification checkpoint;
-- the process failed and cannot recover in-process.
-
-Do not print intermediate snapshots, candidate dumps, or progress logs. Print one small final JSON object containing only requested results and verification evidence.
+Keep all predictable work inside the script. Emit one small final JSON object with only the requested result and enough evidence to prove completion. Do not print intermediate snapshots, candidate dumps, or progress logs.
 
 ## Explicit tab selection
 
-Every invocation must select a tab before using `page.*`:
+Every invocation must select a tab before `page.*`:
 
 ```javascript
 await browser.openTab(url, { active: false, wait: true })
@@ -55,71 +57,61 @@ await browser.useTab(tabId)
 
 Use the lowest rung that can determine the next action:
 
-1. Known URL, selector, or final-state read.
-2. Targeted locator collection: `count`, `allInnerTexts`, `evaluateAll`, `inputValue`, `getAttribute`.
+1. Known URL, known semantic locator, known selector, or final-state read.
+2. Bounded collection read: `count`, `allInnerTexts`, `evaluateAll`, `inputValue`, `getAttribute`.
 3. Bounded text candidates: `page.findText(...)`.
-4. Incremental change: `page.observe()` after an earlier snapshot/observe.
-5. Compact snapshot: `page.snapshot()` only for an unfamiliar state.
+4. Incremental change: `page.observe()` after a baseline snapshot or observe.
+5. Compact semantic snapshot only for an unfamiliar state.
 6. Normal snapshot only when compact output is inadequate.
 
-Never dump full HTML. Never use a broad `querySelectorAll('*')` dump. Bound collection outputs and map them to only fields needed for the task.
-
-### Snapshot modes
+Never dump full HTML or a broad `querySelectorAll('*')` result. Map collections to only the fields needed for the decision and bound the number of returned items.
 
 ```javascript
-await page.snapshot()                                  // compact, ~3500 chars
+await page.snapshot()                                  // compact, about 3500 chars
 await page.snapshot({ mode: 'compact', maxChars: 2000 })
 await page.snapshot({ mode: 'normal', maxChars: 12000 })
-```
-
-Compact is the default and omits most body text. Do not request `debug` mode during normal agent work.
-
-Do not snapshot after every action. Re-snapshot only after navigation, a major DOM replacement, a stale ref, or a materially unknown state.
-
-### Incremental observation
-
-After a baseline snapshot or observe, use:
-
-```javascript
 const change = await page.observe({ maxChanges: 12 })
 ```
 
-It returns compact `added` and `removed` lines. On first observation or a large change it can include a compact snapshot. Prefer this over another full snapshot when checking what changed after an action.
+Do not snapshot after every action. Re-snapshot only after navigation, a major DOM replacement, a stale ref, or a materially unknown state. Snapshot `@N` refs belong only to the latest snapshot in the current invocation.
 
-## Outcome-first behavior
+## Semantic locators first
 
-Choose the least-stateful reliable route before inspecting controls.
+Prefer stable semantic locators over selector discovery:
 
-- When a stable URL reliably encodes the requested outcome and the interaction itself is not required, navigate directly and verify the goal state.
-- Use controls when the user requested the interaction, the interaction is under test, or no reliable route is known.
-- Never invent undocumented routes.
+```javascript
+await page.getByRole('button', { name: /save/i }).click()
+await page.getByLabel('Email').fill('me@example.com')
+const headings = await page.getByRole('heading').allInnerTexts()
+```
 
-Before changing a control, perform only the smallest read needed to see whether the requested state is already satisfied. If it is, do not replay the action.
-
-A successful click is not completion evidence. Verify the required URL, selected value, message, record, or other postcondition before the command exits.
-
-## In-process branching pattern
+For page-specific collections, extract structured candidates once, choose in JavaScript, act, and verify without leaving the invocation:
 
 ```powershell
 @'
-await browser.openTab('https://example.com/settings', { active: false, wait: true })
-
-const name = page.locator('input[name=displayName]')
-const current = await name.inputValue()
-if (current !== 'New name') {
-  await name.fill('New name')
-  await page.locator('button[type=submit]').click()
-  const saved = await page.waitForSelector('.success', { state: 'visible', timeout: 10000 })
-  if (!saved) throw new Error('Save confirmation did not appear')
-}
-
-console.log(JSON.stringify({ url: await page.url(), value: await name.inputValue() }))
+await browser.openTab('https://example.com/search', { active: false, wait: true })
+const cards = page.locator('article')
+const items = await cards.evaluateAll((nodes) => nodes.slice(0, 20).map((node) => ({
+  title: node.querySelector('h2')?.textContent?.trim(),
+  href: node.querySelector('a')?.href,
+})))
+const chosenIndex = items.findIndex((item) => item.title && item.href)
+if (chosenIndex < 0) throw new Error('No usable result')
+const before = await page.url()
+const navigated = page.waitForURL((url) => url.href !== before, { timeout: 15000 })
+await cards.nth(chosenIndex).click()
+if (!(await navigated)) throw new Error('Chosen result did not navigate')
+console.log(JSON.stringify({ chosen: items[chosenIndex], opened: await page.url() }))
 '@ | ego-chrome nodejs
 ```
 
 ## Dynamic interfaces
 
-For menus, popups, choosers, listboxes, dialogs, and nested custom elements, use generic bounded helpers instead of site-specific scripts:
+For menus, popups, account choosers, listboxes, dialogs, and nested custom elements:
+
+1. Try `getByRole` or `getByLabel`.
+2. Use a bounded `findText()` or `clickText()` when accessible semantics are weak.
+3. Use one compact snapshot only if the new state remains unknown.
 
 ```javascript
 const candidates = await page.findText('Settings', {
@@ -127,7 +119,6 @@ const candidates = await page.findText('Settings', {
   selector: '[role="menuitem"], [role="option"], button, a, li',
   maxResults: 10,
 })
-
 if (!candidates.count) throw new Error('Settings action was not found')
 await page.clickText('Settings', {
   exact: true,
@@ -135,44 +126,48 @@ await page.clickText('Settings', {
 })
 ```
 
-When multiple matches exist, inspect the compact candidate list in JavaScript and choose `nth` there. Do not print unrelated private text.
+Do not stop merely because an ordinary menu, chooser, popup, or dialog opened. Continue through normal selections. Ask the user only for a password, passkey, CAPTCHA, security key, two-factor code, recovery confirmation, payment authorization, destructive confirmation, or another genuine human/secret checkpoint.
 
-Ordinary account selection, menus, popups, and dialogs remain automatable. Ask the user only for passwords, passkeys, CAPTCHAs, security keys, two-factor codes, recovery confirmation, payment authorization, destructive confirmation, or another genuine human/secret checkpoint.
+## Execution rules
 
-## Waits and recovery
+- `page.url()` is asynchronous; always use `await page.url()`. A `page.waitForURL(...)` predicate receives a `URL` object.
+- `page.waitForURL`, `page.waitForLoadState`, `page.waitForSelector`, and locator `waitFor` return a falsy value on timeout. Check the result or immediately verify the required state.
+- Register navigation or result-state waits before the action that triggers them. Prefer state-based waits; use `waitForTimeout` only for brief settling.
+- When page structure is unknown, collect relevant controls or candidates once with `evaluateAll`, `allInnerTexts`, `findText`, or one compact snapshot. Derive the next actions in JavaScript instead of enumerating selector guesses across commands.
+- Let a successful action carry the script forward. Read state when it determines a branch and once for the required final postconditions, not after every action.
+- On failure, use one targeted observation to change strategy materially. Do not repeat near-identical locators, commands, or snapshots.
+- When a required click may navigate the current tab or open another one, click once and resolve the result from the URL plus a refreshed `browser.listTabs()` inside the same script. Do not silently replace a user-requested interaction with direct navigation.
 
-Start URL or result-state waits before the triggering action:
+## Interaction paths
 
-```javascript
-const navigated = page.waitForURL((url) => url.pathname === '/results', { timeout: 15000 })
-await page.locator('input[type=search]').fill('query')
-await page.locator('input[type=search]').press('Enter')
-if (!(await navigated)) throw new Error('Expected navigation did not occur')
-```
+1. **Semantic: locators and compact snapshots.** Use for normal DOM pages.
+2. **Direct DOM: locator collections and `page.evaluate`.** Use for bounded structured extraction and page-wide state.
+3. **Capability boundary.** Canvas, WebGL, maps, remote desktops, and visual-only editors cannot be reliably understood without a separate visual tool. Do not guess coordinates.
 
-`waitForLoadState()` only checks the current document. It does not prove a newly triggered navigation happened.
-
-On failure, make one targeted observation that materially changes strategy. Do not repeat near-identical selector guesses or snapshots. Prefer a stable semantic/text/DOM route based on the evidence, then stop and report the boundary if it still fails.
+Combine available paths within the same invocation whenever their next inputs are already available to the script.
 
 ## API highlights
 
 ```javascript
-await page.snapshot({ mode: 'compact', maxChars: 3500 })
-await page.observe({ maxChanges: 20 })
-await page.findText('Continue', { maxResults: 10 })
-await page.clickText('Continue', { exact: true })
+await page.getByRole('button', { name: /continue/i }).click()
+await page.getByLabel('Search').fill('query')
+await page.getByRole('heading').first().innerText()
+await page.getByRole('option').nth(1).click()
 
 const rows = page.locator('table tbody tr')
 await rows.count()
 await rows.allInnerTexts()
-await rows.evaluateAll((nodes) => nodes.map((node) => ({
-  id: node.getAttribute('data-id'),
-  text: node.innerText,
-})))
+await rows.evaluateAll((nodes) => nodes.slice(0, 50).map((node) => node.innerText))
 await rows.first().innerText()
 await rows.nth(1).click()
+
+await page.findText('Continue', { maxResults: 10 })
+await page.clickText('Continue', { exact: true })
+await page.observe({ maxChanges: 20 })
 ```
 
-Snapshot `@N` refs are valid only for the latest snapshot in the current invocation. Prefer stable selectors or semantic locators for reusable logic.
+`taskSpaces` are compatibility labels only in ego-chrome. They do not isolate tabs or sessions. Do not add them to simple tasks.
 
-`taskSpaces` are compatibility labels only in this project. Do not add them to simple tasks; they do not isolate tabs or sessions.
+## Attribution
+
+Core execution guidance in this skill is adapted from CitroLabs `ego-lite` / `ego-browser` 1.2.6 under the MIT License. See the repository's `THIRD_PARTY_NOTICES.md`.
