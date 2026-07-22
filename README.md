@@ -3,7 +3,7 @@
 A personal, local-first Chrome extension and Codex skill for browser automation with two priorities:
 
 1. reuse the login state in your current Chrome profile;
-2. keep model input small by using semantic text snapshots instead of screenshots.
+2. keep model input small with semantic text snapshots instead of screenshots.
 
 The project is inspired by ego-lite's interaction model, but it does not ship or modify Chromium. A Manifest V3 extension attaches to selected tabs through `chrome.debugger`, reads the accessibility tree plus a compact DOM fallback, and exposes a small Playwright-like JavaScript API through the `ego-chrome` CLI.
 
@@ -13,7 +13,8 @@ The project is inspired by ego-lite's interaction model, but it does not ship or
 - Opens automation tabs in the background by default.
 - Produces compact semantic snapshots with temporary `@N` references.
 - Clicks and fills elements by snapshot ref or CSS selector.
-- Supports navigation, key presses, page evaluation, targeted text extraction, selectors, and waits.
+- Supports navigation, trusted key presses, URL waits, page evaluation, targeted text extraction, selectors, and waits.
+- Remembers the last selected automation tab across CLI invocations while the bridge is running.
 - Includes an installable Codex skill under `skills/ego-chrome`.
 - Does not expose screenshot capture in its default API.
 
@@ -33,7 +34,7 @@ Local Node CLI ── HTTP RPC ── Local bridge ── long poll ── Chrom
                                                    current Chrome profile
 ```
 
-The bridge binds only to `127.0.0.1` and requires a random 256-bit token. The extension stores the token in `chrome.storage.local` and maintains a localhost long-poll connection to the bridge. This avoids a Windows Native Messaging registration step and is intended for personal use on one machine.
+The bridge binds only to `127.0.0.1` and requires a random 256-bit token. The extension stores the token in `chrome.storage.local` and maintains a localhost long-poll connection to the bridge. This avoids Windows Native Messaging registration and is intended for personal use on one machine.
 
 ## Requirements
 
@@ -61,13 +62,13 @@ npm link
 ego-chrome init
 ```
 
-The command writes the configuration to:
+The configuration is stored at:
 
 ```text
 %LOCALAPPDATA%\ego-chrome\config.json
 ```
 
-It prints a 64-character hexadecimal token. Copy that token.
+Copy the 64-character token printed by the command.
 
 ### 3. Load the Chrome extension
 
@@ -103,8 +104,6 @@ A healthy result resembles:
 }
 ```
 
-If the extension is disconnected, keep Chrome open, verify the token in the extension options, and click the extension icon once.
-
 ### 5. Install the Codex skill
 
 ```powershell
@@ -117,7 +116,9 @@ The script copies the skill to:
 ~\.agents\skills\ego-chrome
 ```
 
-Restart Codex after installation. The skill can also be installed from its GitHub directory with Codex's `$skill-installer`.
+Restart Codex after installation.
+
+When updating the repository, run the install script again so Codex receives the latest `SKILL.md`.
 
 ## Direct CLI usage
 
@@ -125,13 +126,11 @@ PowerShell uses a here-string piped to the CLI:
 
 ```powershell
 @'
-const task = await taskSpaces.useOrCreate('check profile')
-await browser.openOrReuseTab('https://github.com/settings/profile', {
+await browser.openOrReuseTab('https://example.com', {
   active: false,
-  wait: true
+  wait: true,
 })
-console.log(await page.snapshot())
-await taskSpaces.complete(task.name, { keep: true })
+console.log(await page.snapshot({ maxChars: 2500 }))
 '@ | ego-chrome nodejs
 ```
 
@@ -140,48 +139,68 @@ Bash-compatible shells can use a heredoc:
 ```bash
 ego-chrome nodejs <<'EOF'
 await browser.openOrReuseTab('https://example.com', { active: false, wait: true })
-console.log(await page.snapshot())
+console.log(await page.snapshot({ maxChars: 2500 }))
 EOF
 ```
 
-A typical snapshot looks like:
+## Google search example
 
-```text
-page "Your profile" url="https://github.com/settings/profile"
-main
-  heading "Public profile" [level=2]
-  @1 textbox "Name" [value="Example User"]
-  @2 textbox "Public email"
-  @3 button "Update profile"
-```
-
-Refs are rebuilt by `page.snapshot()`. After navigation or a major DOM change, take a new snapshot before using refs again.
-
-A full action and verification can remain in one invocation:
+For an outcome-oriented search, use the stable result URL instead of replaying the homepage UI:
 
 ```powershell
 @'
-await browser.openOrReuseTab('https://example.com/account', { active: false, wait: true })
-console.log(await page.snapshot())
-await page.fill('@1', 'New display name')
-await page.click('@2')
-const saved = await page.waitForSelector('.success-message', {
-  state: 'visible',
-  timeout: 10000
-})
-if (!saved) throw new Error('Save confirmation did not appear')
-console.log({
-  url: await page.url(),
-  message: await page.textContent('.success-message')
-})
+const query = 'youtube'
+const url = new URL('https://www.google.com/search')
+url.searchParams.set('q', query)
+await browser.openOrReuseTab(url.href, { active: false, wait: true })
+if (!(await page.waitForURL((value) => value.searchParams.get('q') === query, { timeout: 10000 }))) {
+  throw new Error('Search URL was not reached')
+}
+console.log({ url: await page.url(), title: await page.title() })
 '@ | ego-chrome nodejs
 ```
 
-For small commands, `-e` is also supported:
+When the interaction itself is being tested, fill the search control and wait for the resulting URL:
 
 ```powershell
-ego-chrome -e "console.log(await browser.listTabs())"
+@'
+await browser.openOrReuseTab('https://www.google.com/', { active: false, wait: true })
+const query = 'youtube'
+const search = page.locator('textarea[name=q], input[name=q]')
+const navigated = page.waitForURL(
+  (url) => url.pathname === '/search' && url.searchParams.get('q') === query,
+  { timeout: 15000 },
+)
+await search.fill(query)
+await search.press('Enter')
+if (!(await navigated)) throw new Error('Google search did not navigate')
+console.log({ url: await page.url(), title: await page.title() })
+'@ | ego-chrome nodejs
 ```
+
+`page.waitForLoadState()` checks the current document's readiness. It can return before a newly triggered navigation starts, so use `page.waitForURL()` or a result selector to verify action-triggered navigation.
+
+## Snapshot format
+
+A typical result looks like:
+
+```text
+page "Account settings" url="https://example.com/account"
+main
+  heading "Profile" [level=1]
+  @1 textbox "Display name" [value="Example User"]
+  @2 button "Save"
+```
+
+Refs are temporary. A new snapshot rebuilds them, and navigation may make older refs stale.
+
+The snapshot engine uses:
+
+1. `Accessibility.getFullAXTree` for roles, accessible names, values, and states;
+2. `DOMSnapshot.captureSnapshot` to recover meaningful clickable elements omitted by the accessibility tree;
+3. `backendDOMNodeId` references for actions.
+
+No image is sent to Codex.
 
 ## API
 
@@ -197,7 +216,9 @@ await browser.closeTab(tabId)
 await browser.activateTab(tabId)
 ```
 
-URL match modes are `exact`, `origin`, `origin+path`, and `includes`.
+The bridge remembers the selected tab across CLI invocations while it remains running. This removes the need to call `browser.listTabs()` and manually copy a tab ID after every command.
+
+Matching modes are `exact`, `origin`, `origin+path`, and `includes`.
 
 ### `page`
 
@@ -207,7 +228,6 @@ await page.click('@1')
 await page.click('button[type=submit]')
 await page.fill('@2', 'value')
 await page.press('Enter')
-await page.press('Control+A')
 await page.goto('https://example.com')
 await page.info()
 await page.url()
@@ -216,77 +236,59 @@ await page.evaluate(() => document.title)
 await page.textContent('.message')
 await page.count('table tbody tr')
 await page.waitForSelector('.ready', { state: 'visible', timeout: 10000 })
+await page.waitForURL('/complete', { timeout: 10000 })
+await page.waitForURL(/\/orders\/\d+$/, { timeout: 10000 })
+await page.waitForURL((url) => url.searchParams.get('saved') === '1')
 await page.waitForLoadState({ timeout: 20000 })
 await page.waitForTimeout(250)
 ```
 
-Basic locator facade:
+Locator facade:
 
 ```javascript
 const email = page.locator('input[name=email]')
 await email.fill('me@example.com')
+await email.press('Enter')
 await page.locator('button[type=submit]').click()
-const text = await page.locator('.status').textContent()
+const status = await page.locator('.status').textContent()
 ```
+
+Locator `press()` focuses the element and sends a trusted CDP key event, so it can trigger normal browser default behavior such as form submission.
 
 ### `taskSpaces`
 
 ```javascript
-const task = await taskSpaces.useOrCreate('order lookup')
+const task = await taskSpaces.useOrCreate('short goal name')
 await taskSpaces.complete(task.name, { keep: true })
 ```
 
-In this MVP, task spaces are logical labels within one CLI invocation. They do not isolate cookies, local storage, tabs, or site sessions.
+Task spaces are optional compatibility labels inside one CLI invocation. They do not isolate cookies, local storage, tabs, or site sessions.
 
-## How snapshots save tokens
+## Token-saving behavior
 
-The extension uses:
+The bundled skill tells Codex to:
 
-1. `Accessibility.getFullAXTree` for roles, accessible names, values, and control states;
-2. `DOMSnapshot.captureSnapshot` only to recover labeled clickable elements omitted by the accessibility tree;
-3. `backendDOMNodeId` references for clicking and filling.
-
-The result is compact text, not an image. The bundled skill tells Codex to:
-
-- use `page.snapshot()` to discover an unfamiliar page;
+- use `page.snapshot()` instead of screenshots;
 - avoid dumping raw HTML;
 - keep snapshots under 12,000 characters by default;
-- use direct extraction once the page structure is known;
-- keep predictable actions and verification in one JavaScript invocation;
-- take another snapshot only when a new page state must be understood.
+- prefer a stable result URL when the requested outcome can be encoded reliably;
+- use targeted reads after page structure is known;
+- keep predictable actions and verification in one invocation;
+- take another snapshot only when the new page state must be understood.
 
 ## Login state and privacy
 
-The extension controls tabs inside your current Chrome profile, so sites use the same cookies and storage as your normal tabs.
+The extension controls tabs inside your current Chrome profile, so sites see the same login cookies and storage as your normal tabs.
 
-The project does not export cookies or credentials. Snapshot text and explicit reads are returned to the local Codex process because Codex needs that page information to carry out the requested task.
+The project does not export cookies or credentials. Snapshot content and explicit page reads are returned to the local Codex process because Codex needs that information to perform the requested task.
 
-The Chrome `debugger` permission is powerful. Only install source you have reviewed. Rotate the bridge token with:
+Treat the extension's `debugger` permission as sensitive. Rotate the bridge token with:
 
 ```powershell
 ego-chrome init --force
 ```
 
 Then update the token in the extension options.
-
-The bridge checks all of the following:
-
-- it listens only on localhost;
-- every connection must present the configured token;
-- extension connections must use a Chrome extension origin;
-- each routed RPC response is returned only to the requesting CLI connection.
-
-This is still personal-use software and has not received a security audit.
-
-## Limitations
-
-- Opening DevTools on the same tab or attaching another debugger can disconnect automation.
-- The MVP snapshots and controls the top-level document. Deep cross-origin iframe support is not implemented yet.
-- Canvas, WebGL, remote desktops, maps, and other visual-only surfaces are not semantically observable.
-- Browser-internal pages such as `chrome://settings` cannot be controlled.
-- Background tabs share the same cookies and storage. This enables login reuse but is not isolation.
-- `taskSpaces` currently provides lifecycle-shaped labels, not true browser workspaces.
-- Snapshot refs are temporary and process-local.
 
 ## Troubleshooting
 
@@ -298,33 +300,33 @@ Run:
 ego-chrome --doctor
 ```
 
-Verify that the extension options contain the same token and port as:
-
-```text
-%LOCALAPPDATA%\ego-chrome\config.json
-```
+Verify that the extension options contain the same token and port as `%LOCALAPPDATA%\ego-chrome\config.json`, then click the extension icon.
 
 ### `Another debugger is already attached`
 
-Close Chrome DevTools for that tab and temporarily disable other automation/debugging extensions.
+Close DevTools for that tab and temporarily disable other browser automation extensions.
 
 ### `Unknown or stale ref`
 
-The page changed after the last snapshot. Call `page.snapshot()` again and use the new ref.
+The page changed after the last snapshot. Take one new snapshot and use the new ref.
 
-### Port 32145 is already used
+### Action succeeded but Codex ran extra commands
+
+Verify the postcondition with `page.waitForURL()` or `page.waitForSelector()` in the same invocation. `page.waitForLoadState()` alone does not prove that an action-triggered navigation occurred.
+
+### Port 32145 is already in use
 
 Change `port` in `%LOCALAPPDATA%\ego-chrome\config.json`, then enter the same port in the extension options.
 
-### CLI is installed but Codex does not see the skill
+## Important limitations
 
-Confirm this file exists:
-
-```text
-~\.agents\skills\ego-chrome\SKILL.md
-```
-
-Then restart Codex.
+- Opening DevTools or attaching another debugger to the same tab can disconnect automation.
+- Deep cross-origin iframe snapshot merging is not implemented yet.
+- Canvas, WebGL, maps, remote desktops, and visual-only surfaces are not semantically observable.
+- Browser-internal pages such as `chrome://settings` cannot be controlled.
+- Background tabs share the same cookie and storage state. This is intentional for login reuse, not security isolation.
+- The selected tab survives separate CLI invocations only while the local bridge process remains running.
+- The bridge is personal-use software and has not received a security audit.
 
 ## Development
 
@@ -332,21 +334,18 @@ Then restart Codex.
 npm install
 npm run check
 npm test
-npm run bridge
 ```
 
-After changing extension files, open `chrome://extensions` and click **Reload** on the extension card.
+After changing extension files, open `chrome://extensions` and click **Reload** on the extension card. After changing the skill, rerun `scripts/install-skill.ps1` and restart Codex.
 
 ## Roadmap
 
-The highest-value next improvements are:
-
-1. recursive cross-origin iframe attachment and snapshot merging;
-2. incremental snapshot diffs;
-3. tab-group-backed task spaces;
-4. semantic `getByRole` and `getByLabel` locators;
-5. downloads, uploads, dialogs, and network waits;
-6. an explicit visual fallback for exceptional pages, disabled by default.
+1. Recursive cross-origin iframe attachment and snapshot merging.
+2. Incremental snapshot diffs.
+3. Tab-group-backed task spaces.
+4. Semantic locators such as `getByRole` and `getByLabel`.
+5. Downloads, uploads, dialogs, and network waits.
+6. Explicit visual fallback for exceptional pages, disabled by default.
 
 ## License
 
