@@ -12,6 +12,7 @@ export function startBridge(config, options = {}) {
   const queue = []
   const pollWaiters = new Set()
   let extensionLastSeenAt = 0
+  let selectedTabId = null
 
   const server = createServer(async (request, response) => {
     try {
@@ -64,6 +65,22 @@ export function startBridge(config, options = {}) {
               extension: Date.now() - extensionLastSeenAt < EXTENSION_FRESH_MS ? 'connected' : 'disconnected',
             },
           })
+        }
+        if (message.method === 'bridge.session.currentTab') {
+          return json(response, 200, { result: selectedTabId ? { tabId: selectedTabId } : null })
+        }
+        if (message.method === 'bridge.session.selectTab') {
+          const tabId = Number(message.params?.tabId)
+          if (!Number.isInteger(tabId) || tabId <= 0) {
+            return json(response, 400, { error: { code: 'INVALID_TAB', message: `Invalid tab id: ${message.params?.tabId}` } })
+          }
+          selectedTabId = tabId
+          return json(response, 200, { result: { tabId } })
+        }
+        if (message.method === 'bridge.session.clearTab') {
+          const tabId = Number(message.params?.tabId)
+          if (!message.params?.tabId || selectedTabId === tabId) selectedTabId = null
+          return json(response, 200, { result: { cleared: true } })
         }
         if (Date.now() - extensionLastSeenAt >= EXTENSION_FRESH_MS) {
           return json(response, 503, {
