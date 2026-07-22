@@ -7,14 +7,16 @@ A personal, local-first Chrome extension and Codex skill for browser automation 
 
 The project is inspired by ego-lite's interaction model, but it does not ship or modify Chromium. A Manifest V3 extension attaches to selected tabs through `chrome.debugger`, reads the accessibility tree plus a compact DOM fallback, and exposes a small Playwright-like JavaScript API through the `ego-chrome` CLI.
 
-## MVP capabilities
+## Current capabilities
 
 - Reuses current Chrome cookies, site storage, extensions, and logged-in sessions.
 - Opens automation tabs in the background by default.
 - Produces compact semantic snapshots with temporary `@N` references.
 - Clicks and fills elements by snapshot ref or CSS selector.
-- Supports navigation, trusted key presses, URL waits, page evaluation, targeted text extraction, selectors, and waits.
-- Remembers the last selected automation tab across CLI invocations while the bridge is running.
+- Finds and clicks visible text in dynamic menus and custom elements with a real CDP mouse event.
+- Supports trusted key presses, URL waits, page evaluation, targeted text extraction, selectors, and waits.
+- Requires explicit tab selection before any page operation, preventing accidental takeover of an unrelated tab.
+- Remembers the last automation tab for explicit continuation across CLI invocations while the bridge is running.
 - Includes an installable Codex skill under `skills/ego-chrome`.
 - Does not expose screenshot capture in its default API.
 
@@ -116,17 +118,38 @@ The script copies the skill to:
 ~\.agents\skills\ego-chrome
 ```
 
-Restart Codex after installation.
+Restart Codex after installation. Rerun the script after updating the repository.
 
-When updating the repository, run the install script again so Codex receives the latest `SKILL.md`.
+## Upgrade
 
-## Direct CLI usage
+```powershell
+git pull
+npm install
+npm link
+powershell -ExecutionPolicy Bypass -File .\scripts\install-skill.ps1
+```
+
+Runtime-only updates do not require reloading the Chrome extension. If files under `extension/` changed, reload the unpacked extension from `chrome://extensions`.
+
+The bridge is a detached Node process. After runtime or bridge changes, stop the old process once so the next CLI invocation starts the new code:
+
+```powershell
+$bridgePid = (
+  Get-NetTCPConnection -LocalPort 32145 -State Listen -ErrorAction SilentlyContinue
+).OwningProcess
+
+if ($bridgePid) {
+  Stop-Process -Id $bridgePid -Force
+}
+```
+
+## Quick start
 
 PowerShell uses a here-string piped to the CLI:
 
 ```powershell
 @'
-await browser.openOrReuseTab('https://example.com', {
+await browser.openTab('https://example.com', {
   active: false,
   wait: true,
 })
@@ -138,49 +161,42 @@ Bash-compatible shells can use a heredoc:
 
 ```bash
 ego-chrome nodejs <<'EOF'
-await browser.openOrReuseTab('https://example.com', { active: false, wait: true })
+await browser.openTab('https://example.com', { active: false, wait: true })
 console.log(await page.snapshot({ maxChars: 2500 }))
 EOF
 ```
 
-## Google search example
+## Explicit tab safety
 
-For an outcome-oriented search, use the stable result URL instead of replaying the homepage UI:
+Every CLI invocation must select an automation tab before using `page.*`.
 
-```powershell
-@'
-const query = 'youtube'
-const url = new URL('https://www.google.com/search')
-url.searchParams.set('q', query)
-await browser.openOrReuseTab(url.href, { active: false, wait: true })
-if (!(await page.waitForURL((value) => value.searchParams.get('q') === query, { timeout: 10000 }))) {
-  throw new Error('Search URL was not reached')
-}
-console.log({ url: await page.url(), title: await page.title() })
-'@ | ego-chrome nodejs
+```javascript
+await browser.openTab(url, { active: false, wait: true })
+await browser.openOrReuseTab(url, { active: false, match: 'exact', wait: true })
+await browser.continueLastTab()
+await browser.useActiveTab()
+await browser.useTab(tabId)
 ```
 
-When the interaction itself is being tested, fill the search control and wait for the resulting URL:
+The intended meanings are:
 
-```powershell
-@'
-await browser.openOrReuseTab('https://www.google.com/', { active: false, wait: true })
-const query = 'youtube'
-const search = page.locator('textarea[name=q], input[name=q]')
-const navigated = page.waitForURL(
-  (url) => url.pathname === '/search' && url.searchParams.get('q') === query,
-  { timeout: 15000 },
-)
-await search.fill(query)
-await search.press('Enter')
-if (!(await navigated)) throw new Error('Google search did not navigate')
-console.log({ url: await page.url(), title: await page.title() })
-'@ | ego-chrome nodejs
+- `openTab`: create a new background tab for a new destination;
+- `openOrReuseTab`: explicitly reuse a matching tab when desired;
+- `continueLastTab`: continue the previous automation tab in a follow-up CLI invocation;
+- `useActiveTab`: explicitly opt into controlling the currently visible user tab;
+- `useTab`: select a known tab ID.
+
+`page.goto()` only navigates inside a tab that was explicitly selected in the current invocation.
+
+If no tab is selected, page operations fail with:
+
+```text
+No automation tab selected
 ```
 
-`page.waitForLoadState()` checks the current document's readiness. It can return before a newly triggered navigation starts, so use `page.waitForURL()` or a result selector to verify action-triggered navigation.
+This is deliberate. The runtime never silently falls back to the active user tab or the previously remembered tab.
 
-## Snapshot format
+## Semantic snapshots
 
 A typical result looks like:
 
@@ -202,6 +218,67 @@ The snapshot engine uses:
 
 No image is sent to Codex.
 
+## Dynamic menus and text locators
+
+Modern sites often render menus with nested custom elements. A CSS selector may find a text child rather than the element that owns the click handler.
+
+Use the generic text APIs:
+
+```javascript
+const candidates = await page.findText('Settings', {
+  exact: false,
+  selector: '[role="menuitem"], [role="option"], button, a, li',
+  maxResults: 20,
+})
+
+console.log(candidates)
+
+await page.clickText('Settings', {
+  exact: true,
+  selector: '[role="menuitem"], button, a, li',
+  nth: 0,
+})
+
+await page.getByText('Continue', { exact: true }).click()
+```
+
+`findText()` returns compact candidate summaries. `clickText()` temporarily marks the chosen visible element and then calls the normal CDP-backed click path. The final interaction is a real browser mouse event, not a synthetic JavaScript `.click()`.
+
+Options:
+
+- `exact`: require normalized full-text equality;
+- `caseSensitive`: preserve case during matching;
+- `nth`: choose one match by DOM order;
+- `selector`: restrict candidates to matching ancestors;
+- `maxResults`: cap returned candidate summaries.
+
+## Navigation waits
+
+`page.waitForLoadState()` checks the readiness of the current document. It does not prove that a newly triggered navigation has started.
+
+For an action expected to navigate, start a URL or result-element wait before the action:
+
+```javascript
+const navigated = page.waitForURL(
+  (url) => url.pathname === '/complete',
+  { timeout: 15000 },
+)
+
+await page.locator('button[type=submit]').click()
+
+if (!(await navigated)) {
+  throw new Error('Expected navigation did not occur')
+}
+```
+
+Locator `press()` focuses the element and sends a trusted CDP key event:
+
+```javascript
+const search = page.locator('textarea[name=q], input[name=q]')
+await search.fill('example')
+await search.press('Enter')
+```
+
 ## API
 
 ### `browser`
@@ -209,14 +286,14 @@ No image is sent to Codex.
 ```javascript
 await browser.listTabs()
 await browser.currentTab()
-await browser.useTab(tabId)
-await browser.openOrReuseTab(url, { active: false, match: 'exact', wait: true })
 await browser.openTab(url, { active: false, wait: true })
+await browser.openOrReuseTab(url, { active: false, match: 'exact', wait: true })
+await browser.continueLastTab()
+await browser.useActiveTab()
+await browser.useTab(tabId)
 await browser.closeTab(tabId)
 await browser.activateTab(tabId)
 ```
-
-The bridge remembers the selected tab across CLI invocations while it remains running. This removes the need to call `browser.listTabs()` and manually copy a tab ID after every command.
 
 Matching modes are `exact`, `origin`, `origin+path`, and `includes`.
 
@@ -227,6 +304,9 @@ await page.snapshot({ maxChars: 12000, includeText: true })
 await page.click('@1')
 await page.click('button[type=submit]')
 await page.fill('@2', 'value')
+await page.findText('Menu item', { exact: false })
+await page.clickText('Menu item', { exact: true, nth: 0 })
+await page.getByText('Continue', { exact: true }).click()
 await page.press('Enter')
 await page.goto('https://example.com')
 await page.info()
@@ -243,7 +323,7 @@ await page.waitForLoadState({ timeout: 20000 })
 await page.waitForTimeout(250)
 ```
 
-Locator facade:
+CSS locator facade:
 
 ```javascript
 const email = page.locator('input[name=email]')
@@ -253,8 +333,6 @@ await page.locator('button[type=submit]').click()
 const status = await page.locator('.status').textContent()
 ```
 
-Locator `press()` focuses the element and sends a trusted CDP key event, so it can trigger normal browser default behavior such as form submission.
-
 ### `taskSpaces`
 
 ```javascript
@@ -263,18 +341,6 @@ await taskSpaces.complete(task.name, { keep: true })
 ```
 
 Task spaces are optional compatibility labels inside one CLI invocation. They do not isolate cookies, local storage, tabs, or site sessions.
-
-## Token-saving behavior
-
-The bundled skill tells Codex to:
-
-- use `page.snapshot()` instead of screenshots;
-- avoid dumping raw HTML;
-- keep snapshots under 12,000 characters by default;
-- prefer a stable result URL when the requested outcome can be encoded reliably;
-- use targeted reads after page structure is known;
-- keep predictable actions and verification in one invocation;
-- take another snapshot only when the new page state must be understood.
 
 ## Login state and privacy
 
@@ -310,6 +376,10 @@ Close DevTools for that tab and temporarily disable other browser automation ext
 
 The page changed after the last snapshot. Take one new snapshot and use the new ref.
 
+### `No automation tab selected`
+
+Choose the appropriate explicit browser method. For a new destination, use `browser.openTab()`. For a follow-up command, use `browser.continueLastTab()`.
+
 ### Action succeeded but Codex ran extra commands
 
 Verify the postcondition with `page.waitForURL()` or `page.waitForSelector()` in the same invocation. `page.waitForLoadState()` alone does not prove that an action-triggered navigation occurred.
@@ -325,7 +395,7 @@ Change `port` in `%LOCALAPPDATA%\ego-chrome\config.json`, then enter the same po
 - Canvas, WebGL, maps, remote desktops, and visual-only surfaces are not semantically observable.
 - Browser-internal pages such as `chrome://settings` cannot be controlled.
 - Background tabs share the same cookie and storage state. This is intentional for login reuse, not security isolation.
-- The selected tab survives separate CLI invocations only while the local bridge process remains running.
+- The remembered tab survives only while the local bridge process remains running.
 - The bridge is personal-use software and has not received a security audit.
 
 ## Development
@@ -336,14 +406,14 @@ npm run check
 npm test
 ```
 
-After changing extension files, open `chrome://extensions` and click **Reload** on the extension card. After changing the skill, rerun `scripts/install-skill.ps1` and restart Codex.
+After changing extension files, reload the unpacked extension. After changing the skill, rerun `scripts/install-skill.ps1` and restart Codex.
 
 ## Roadmap
 
 1. Recursive cross-origin iframe attachment and snapshot merging.
 2. Incremental snapshot diffs.
 3. Tab-group-backed task spaces.
-4. Semantic locators such as `getByRole` and `getByLabel`.
+4. Semantic role and label locators.
 5. Downloads, uploads, dialogs, and network waits.
 6. Explicit visual fallback for exceptional pages, disabled by default.
 
