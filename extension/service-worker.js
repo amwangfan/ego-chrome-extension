@@ -6,6 +6,7 @@ const attachedTabs = new Set()
 const attachPromises = new Map()
 let pollGeneration = 0
 let polling = false
+let pollController = null
 
 chrome.runtime.onInstalled.addListener(() => {
   chrome.runtime.openOptionsPage().catch(() => {})
@@ -33,10 +34,12 @@ restartPolling()
 function restartPolling() {
   pollGeneration += 1
   polling = false
-  void pollBridge(pollGeneration)
+  pollController?.abort()
+  pollController = new AbortController()
+  void pollBridge(pollGeneration, pollController.signal)
 }
 
-async function pollBridge(generation) {
+async function pollBridge(generation, signal) {
   const { token = '', port = DEFAULT_PORT } = await chrome.storage.local.get({ token: '', port: DEFAULT_PORT })
   if (generation !== pollGeneration) return
   if (!token) {
@@ -55,6 +58,7 @@ async function pollBridge(generation) {
         method: 'GET',
         headers: { authorization: `Bearer ${token}` },
         cache: 'no-store',
+        signal,
       })
       if (generation !== pollGeneration) break
       if (response.status === 204) {
@@ -76,7 +80,7 @@ async function pollBridge(generation) {
         body: JSON.stringify(result),
       })
     } catch (error) {
-      if (generation !== pollGeneration) break
+      if (generation !== pollGeneration || error?.name === 'AbortError') break
       setBadge('OFF', '#8a8a8a', `ego-chrome bridge disconnected: ${error?.message || error}`)
       await sleep(delay)
       delay = Math.min(delay * 2, 15_000)
