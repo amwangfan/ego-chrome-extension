@@ -7,11 +7,27 @@ export function createRuntime(rpc, options = {}) {
 
   const call = (method, params = {}, requestOptions) => rpc.request(method, params, requestOptions)
 
+  async function rememberTabId(tabId) {
+    selectedTabId = tabId
+    await call('bridge.session.selectTab', { tabId })
+    return tabId
+  }
+
+  async function clearRememberedTab(tabId) {
+    if (selectedTabId === tabId) selectedTabId = null
+    await call('bridge.session.clearTab', { tabId })
+  }
+
   async function ensureTabId() {
     if (selectedTabId) return selectedTabId
+    const remembered = await call('bridge.session.currentTab')
+    if (remembered?.tabId) {
+      selectedTabId = remembered.tabId
+      return selectedTabId
+    }
     const tab = await call('tabs.active')
     if (!tab?.id) throw new Error('No controllable Chrome tab is active')
-    selectedTabId = tab.id
+    await rememberTabId(tab.id)
     return selectedTabId
   }
 
@@ -21,14 +37,18 @@ export function createRuntime(rpc, options = {}) {
     },
 
     async currentTab() {
-      if (selectedTabId) {
+      const rememberedId = selectedTabId || (await call('bridge.session.currentTab'))?.tabId
+      if (rememberedId) {
         const tabs = await call('tabs.list')
-        const tab = tabs.find((candidate) => candidate.id === selectedTabId)
-        if (tab) return tab
-        selectedTabId = null
+        const tab = tabs.find((candidate) => candidate.id === rememberedId)
+        if (tab) {
+          selectedTabId = tab.id
+          return tab
+        }
+        await clearRememberedTab(rememberedId)
       }
       const tab = await call('tabs.active')
-      if (tab?.id) selectedTabId = tab.id
+      if (tab?.id) await rememberTabId(tab.id)
       return tab
     },
 
@@ -38,13 +58,13 @@ export function createRuntime(rpc, options = {}) {
       const tabs = await call('tabs.list')
       const tab = tabs.find((candidate) => candidate.id === id)
       if (!tab) throw new Error(`Chrome tab not found: ${id}`)
-      selectedTabId = id
+      await rememberTabId(id)
       return tab
     },
 
     async openTab(url = 'about:blank', options = {}) {
       const tab = await call('tabs.open', { url, active: options.active === true })
-      selectedTabId = tab.id
+      await rememberTabId(tab.id)
       if (options.wait !== false && isWebUrl(url)) {
         const loaded = await page.waitForLoadState({ timeout: options.timeout || 20_000 })
         if (!loaded) throw new Error(`Timed out loading ${url}`)
@@ -58,7 +78,7 @@ export function createRuntime(rpc, options = {}) {
       const tabs = await call('tabs.list')
       const existing = tabs.find((tab) => matchUrl(tab.url, url, match))
       if (existing) {
-        selectedTabId = existing.id
+        await rememberTabId(existing.id)
         if (options.active === true) await call('tabs.activate', { tabId: existing.id })
         if (options.wait !== false && isWebUrl(existing.url)) {
           const loaded = await page.waitForLoadState({ timeout: options.timeout || 20_000 })
@@ -74,7 +94,7 @@ export function createRuntime(rpc, options = {}) {
       const id = typeof tabOrId === 'number' ? tabOrId : tabOrId?.id
       if (!Number.isInteger(id)) throw new TypeError('browser.closeTab requires a numeric tab id')
       await call('tabs.close', { tabId: id })
-      if (selectedTabId === id) selectedTabId = null
+      await clearRememberedTab(id)
       return id
     },
 
@@ -82,7 +102,7 @@ export function createRuntime(rpc, options = {}) {
       const id = typeof tabOrId === 'number' ? tabOrId : tabOrId?.id
       if (!Number.isInteger(id)) throw new TypeError('browser.activateTab requires a numeric tab id')
       const tab = await call('tabs.activate', { tabId: id })
-      selectedTabId = id
+      await rememberTabId(id)
       return tab
     },
   }
@@ -166,15 +186,34 @@ export function createRuntime(rpc, options = {}) {
       const state = options.state || 'attached'
       const deadline = Date.now() + timeout
       while (true) {
-        const result = await page.evaluate(({ selector, state }) => {
-          const element = document.querySelector(selector)
-          const visible = Boolean(element && element.getClientRects().length && getComputedStyle(element).visibility !== 'hidden')
-          if (state === 'detached') return !element
-          if (state === 'hidden') return !element || !visible
-          if (state === 'visible') return visible
-          return Boolean(element)
-        }, { selector, state })
-        if (result) return true
+        try {
+          const result = await page.evaluate(({ selector, state }) => {
+            const element = document.querySelector(selector)
+            const visible = Boolean(element && element.getClientRects().length && getComputedStyle(element).visibility !== 'hidden')
+            if (state === 'detached') return !element
+            if (state === 'hidden') return !element || !visible
+            if (state === 'visible') return visible
+            return Boolean(element)
+          }, { selector, state })
+          if (result) return true
+        } catch (error) {
+          if (!isTransientNavigationError(error)) throw error
+        }
+        if (Date.now() >= deadline) return false
+        await page.waitForTimeout(100)
+      }
+    },
+
+    async waitForURL(expected, options = {}) {
+      const timeout = options.timeout ?? DEFAULT_TIMEOUT
+      const deadline = Date.now() + timeout
+      while (true) {
+        try {
+          const href = await page.url()
+          if (urlExpectationMatches(href, expected)) return href
+        } catch (error) {
+          if (!isTransientNavigationError(error)) throw error
+        }
         if (Date.now() >= deadline) return false
         await page.waitForTimeout(100)
       }
@@ -188,7 +227,7 @@ export function createRuntime(rpc, options = {}) {
           const readyState = await page.evaluate(() => document.readyState)
           if (readyState === 'interactive' || readyState === 'complete') return true
         } catch (error) {
-          if (!/Cannot access|No tab|closed|navigation|context|Execution context was destroyed|Inspected target navigated/i.test(error?.message || '')) throw error
+          if (!isTransientNavigationError(error)) throw error
         }
         if (Date.now() >= deadline) return false
         await page.waitForTimeout(100)
@@ -234,14 +273,15 @@ function createLocator(page, selector) {
   return {
     click: (options) => page.click(selector, options),
     fill: (value, options) => page.fill(selector, value, options),
-    press: (key, options) => page.evaluate(({ selector, key }) => {
-      const element = document.querySelector(selector)
-      if (!element) throw new Error(`Element not found: ${selector}`)
-      element.focus()
-      element.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true }))
-      element.dispatchEvent(new KeyboardEvent('keyup', { key, bubbles: true }))
-      return true
-    }, { selector, key }),
+    press: async (key, options) => {
+      await page.evaluate((value) => {
+        const element = document.querySelector(value)
+        if (!element) throw new Error(`Element not found: ${value}`)
+        element.focus()
+        return true
+      }, selector)
+      return page.press(key, options)
+    },
     textContent: () => page.textContent(selector),
     count: () => page.count(selector),
     waitFor: (options) => page.waitForSelector(selector, options),
@@ -280,6 +320,17 @@ export function matchUrl(actual, wanted, mode = 'exact') {
   } catch {
     return actual === wanted
   }
+}
+
+function urlExpectationMatches(href, expected) {
+  if (typeof expected === 'function') return Boolean(expected(new URL(href)))
+  if (expected instanceof RegExp) return expected.test(href)
+  if (typeof expected === 'string') return href === expected || href.includes(expected)
+  throw new TypeError('page.waitForURL expects a string, RegExp, or predicate function')
+}
+
+function isTransientNavigationError(error) {
+  return /Cannot access|No tab|closed|navigation|context|Execution context was destroyed|Inspected target navigated/i.test(error?.message || '')
 }
 
 function trimSlash(pathname) {
