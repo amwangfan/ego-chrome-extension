@@ -4,6 +4,8 @@ const DEFAULT_PORT = 32145
 const refsByTab = new Map()
 const attachedTabs = new Set()
 const attachPromises = new Map()
+const backgroundStateByTab = new Map()
+const originalDiscardabilityByTab = new Map()
 let pollGeneration = 0
 let polling = false
 let pollController = null
@@ -26,6 +28,8 @@ chrome.debugger.onDetach.addListener((source) => {
     attachedTabs.delete(source.tabId)
     attachPromises.delete(source.tabId)
     refsByTab.delete(source.tabId)
+    backgroundStateByTab.delete(source.tabId)
+    void restoreTabDiscardability(source.tabId)
   }
 })
 
@@ -136,17 +140,7 @@ async function dispatch(method, params) {
       refsByTab.delete(requireTabId(params.tabId))
       return sendCommand(params.tabId, 'Page.navigate', { url: String(params.url) })
     case 'page.info':
-      return evaluatePage(params.tabId, `(() => ({
-        url: location.href,
-        title: document.title,
-        readyState: document.readyState,
-        width: innerWidth,
-        height: innerHeight,
-        scrollX,
-        scrollY,
-        pageWidth: document.documentElement?.scrollWidth || innerWidth,
-        pageHeight: document.documentElement?.scrollHeight || innerHeight
-      }))()`)
+      return pageInfo(params.tabId)
     case 'page.evaluate':
       return evaluatePage(params.tabId, String(params.expression))
     default:
@@ -165,6 +159,35 @@ async function snapshotPage(tabId, options = {}) {
   const map = new Map(snapshot.refs.map((ref) => [ref.ref, ref]))
   refsByTab.set(tabId, map)
   return snapshot.content
+}
+
+async function pageInfo(tabId) {
+  tabId = requireTabId(tabId)
+  await ensureAttached(tabId)
+  const tab = await chrome.tabs.get(tabId)
+  const windowInfo = await chrome.windows.get(tab.windowId).catch(() => null)
+  const documentInfo = await evaluatePage(tabId, `(() => ({
+    url: location.href,
+    title: document.title,
+    readyState: document.readyState,
+    visibilityState: document.visibilityState,
+    documentHasFocus: document.hasFocus(),
+    width: innerWidth,
+    height: innerHeight,
+    scrollX,
+    scrollY,
+    pageWidth: document.documentElement?.scrollWidth || innerWidth,
+    pageHeight: document.documentElement?.scrollHeight || innerHeight
+  }))()`)
+  return {
+    ...documentInfo,
+    tabActive: Boolean(tab.active),
+    windowFocused: Boolean(windowInfo?.focused),
+    discarded: Boolean(tab.discarded),
+    frozen: Boolean(tab.frozen),
+    autoDiscardable: Boolean(tab.autoDiscardable),
+    backgroundAutomation: backgroundStateByTab.get(tabId) || null,
+  }
 }
 
 async function clickPage(tabId, target, options = {}) {
@@ -290,16 +313,37 @@ async function ensureAttached(tabId) {
   const attaching = (async () => {
     const tab = await chrome.tabs.get(tabId)
     if (!isControllableUrl(tab.url)) throw rpcError('UNSUPPORTED_URL', `Chrome cannot debug this page: ${tab.url}`)
-    await new Promise((resolve, reject) => {
-      chrome.debugger.attach({ tabId }, '1.3', () => {
-        const error = chrome.runtime.lastError
-        if (error) reject(rpcError('ATTACH_FAILED', error.message))
-        else resolve()
+
+    if (!originalDiscardabilityByTab.has(tabId)) {
+      originalDiscardabilityByTab.set(tabId, tab.autoDiscardable !== false)
+    }
+    await chrome.tabs.update(tabId, { autoDiscardable: false }).catch(() => null)
+    if (tab.discarded) await chrome.tabs.reload(tabId).catch(() => null)
+
+    try {
+      await new Promise((resolve, reject) => {
+        chrome.debugger.attach({ tabId }, '1.3', () => {
+          const error = chrome.runtime.lastError
+          if (error) reject(rpcError('ATTACH_FAILED', error.message))
+          else resolve()
+        })
       })
-    })
-    attachedTabs.add(tabId)
-    await sendCommand(tabId, 'Page.enable').catch(() => null)
-    await sendCommand(tabId, 'DOM.enable').catch(() => null)
+      attachedTabs.add(tabId)
+      await sendCommand(tabId, 'Page.enable').catch(() => null)
+      await sendCommand(tabId, 'DOM.enable').catch(() => null)
+      backgroundStateByTab.set(tabId, {
+        autoDiscardableDisabled: true,
+        lifecycleActivated: await tryBackgroundCommand(tabId, 'Page.setWebLifecycleState', { state: 'active' }),
+        focusEmulation: await tryBackgroundCommand(tabId, 'Emulation.setFocusEmulationEnabled', { enabled: true }),
+        idleOverride: await tryBackgroundCommand(tabId, 'Emulation.setIdleOverride', {
+          isUserActive: true,
+          isScreenUnlocked: true,
+        }),
+      })
+    } catch (error) {
+      await restoreTabDiscardability(tabId)
+      throw error
+    }
   })()
 
   attachPromises.set(tabId, attaching)
@@ -311,10 +355,31 @@ async function ensureAttached(tabId) {
 }
 
 async function detachTab(tabId) {
-  if (!attachedTabs.has(tabId)) return
-  await new Promise((resolve) => chrome.debugger.detach({ tabId }, () => resolve()))
+  if (attachedTabs.has(tabId)) {
+    await sendCommand(tabId, 'Emulation.setFocusEmulationEnabled', { enabled: false }).catch(() => null)
+    await sendCommand(tabId, 'Emulation.clearIdleOverride').catch(() => null)
+    await new Promise((resolve) => chrome.debugger.detach({ tabId }, () => resolve()))
+  }
   attachedTabs.delete(tabId)
   refsByTab.delete(tabId)
+  backgroundStateByTab.delete(tabId)
+  await restoreTabDiscardability(tabId)
+}
+
+async function tryBackgroundCommand(tabId, method, params = {}) {
+  try {
+    await sendCommand(tabId, method, params)
+    return true
+  } catch {
+    return false
+  }
+}
+
+async function restoreTabDiscardability(tabId) {
+  if (!originalDiscardabilityByTab.has(tabId)) return
+  const autoDiscardable = originalDiscardabilityByTab.get(tabId)
+  originalDiscardabilityByTab.delete(tabId)
+  await chrome.tabs.update(tabId, { autoDiscardable }).catch(() => null)
 }
 
 async function listTabs() {
