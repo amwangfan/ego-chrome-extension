@@ -46,7 +46,8 @@ export function createRuntime(rpc, options = {}) {
       const tab = await call('tabs.open', { url, active: options.active === true })
       selectedTabId = tab.id
       if (options.wait !== false && isWebUrl(url)) {
-        await page.waitForLoadState({ timeout: options.timeout || 20_000 })
+        const loaded = await page.waitForLoadState({ timeout: options.timeout || 20_000 })
+        if (!loaded) throw new Error(`Timed out loading ${url}`)
       }
       return tab
     },
@@ -60,7 +61,8 @@ export function createRuntime(rpc, options = {}) {
         selectedTabId = existing.id
         if (options.active === true) await call('tabs.activate', { tabId: existing.id })
         if (options.wait !== false && isWebUrl(existing.url)) {
-          await page.waitForLoadState({ timeout: options.timeout || 20_000 })
+          const loaded = await page.waitForLoadState({ timeout: options.timeout || 20_000 })
+          if (!loaded) throw new Error(`Timed out loading ${existing.url}`)
         }
         return { ...existing, reused: true }
       }
@@ -125,7 +127,8 @@ export function createRuntime(rpc, options = {}) {
       const tabId = await ensureTabId()
       const result = await call('page.goto', { tabId, url })
       if (options.wait !== false) {
-        await page.waitForLoadState({ timeout: options.timeout || 20_000 })
+        const loaded = await page.waitForLoadState({ timeout: options.timeout || 20_000 })
+        if (!loaded) throw new Error(`Timed out loading ${url}`)
       }
       return result
     },
@@ -185,7 +188,7 @@ export function createRuntime(rpc, options = {}) {
           const readyState = await page.evaluate(() => document.readyState)
           if (readyState === 'interactive' || readyState === 'complete') return true
         } catch (error) {
-          if (!/Cannot access|No tab|closed|navigation/i.test(error?.message || '')) throw error
+          if (!/Cannot access|No tab|closed|navigation|context|Execution context was destroyed|Inspected target navigated/i.test(error?.message || '')) throw error
         }
         if (Date.now() >= deadline) return false
         await page.waitForTimeout(100)
