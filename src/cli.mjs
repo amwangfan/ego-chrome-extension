@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 import { createConfig, readConfig } from './config.mjs'
 import { RpcClient } from './rpc-client.mjs'
-import { createRuntime } from './runtime.mjs'
+import { createRuntime } from './low-token-runtime.mjs'
 import { startBridge } from './bridge.mjs'
 
 const here = dirname(fileURLToPath(import.meta.url))
